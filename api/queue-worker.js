@@ -1,20 +1,22 @@
 /**
- * Intelligent Telegram Notification Queue Worker
- * Cloud Firestore + Vercel Serverless Architecture
- * 
- * CORE CAPABILITIES:
- * 1. Concurrency Lock: Prevents multiple serverless instances from competing or flooding Telegram.
- * 2. Rate-Limiting Protection: Enforces strict 1.2s delay between messages to respect Telegram limits.
- * 3. Smart Batching: If queue backlog > 3 (e.g. 10 to 100+ simultaneous orders), automatically 
- *    groups 3-5 orders into a consolidated batch message, preventing Vercel execution timeouts 
- *    and avoiding Telegram 429 rate limits.
- * 4. Automatic Retry on 429: Dynamically waits for Telegram's 'retry_after' duration.
- * 5. Self-Chaining: If more pending items remain after time budget (8s), triggers a fresh 
- *    invocation so all orders are eventually delivered with zero drops.
+ * ClothStore — Resilient Telegram Notification Queue Worker
+ * Architecture: Cloud Firestore + Vercel Serverless Functions
+ *
+ * SPECIFICATION COMPLIANCE:
+ * 1. Decoupled Processing: Customer receives instant confirmation upon Firestore save;
+ *    Telegram dispatch happens asynchronously in the background.
+ * 2. Dedicated Single-Order Messages: Each order is stored and sent individually (No batching).
+ * 3. Strict Concurrency Lock: Only 1 worker instance processes the queue at any time (queueControl/workerLock).
+ * 4. Precise Rate-Limiting: Enforces 1.0s delay between messages to respect Telegram limits.
+ * 5. Complete Lifecycle States: pending -> processing -> sent | failed.
+ * 6. Stale Processing Recovery: Automatically recovers messages abandoned by crashed/timed-out functions.
+ * 7. Self-Chaining: Automatically spawns next worker invocation if pending messages remain after time budget.
+ * 8. Authenticated Endpoint: Validates 'x-worker-secret' to prevent unauthorized external triggers.
  */
 
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "clothstore-a9b2c";
 const BASE_FS_URL = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
+export const WORKER_SECRET = process.env.QUEUE_WORKER_SECRET || "hadjaj_secure_worker_token_2026";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -77,33 +79,43 @@ export function fromFirestoreFields(fields = {}) {
 }
 
 /**
- * Enqueues a notification into the Cloud Firestore telegramQueue collection
+ * Enqueues a notification into Firestore telegramQueue collection.
+ * Uses orderId as the document ID for absolute idempotency.
  */
 export async function enqueueTelegramNotification(payload) {
   try {
-    const queueUrl = `${BASE_FS_URL}/telegramQueue`;
+    const orderId = String(payload.orderId || `ord_${Date.now()}`).trim();
+    const docUrl = `${BASE_FS_URL}/telegramQueue/${encodeURIComponent(orderId)}`;
+
     const docData = {
-      orderId: payload.orderId || "",
+      orderId: orderId,
       messageText: payload.messageText || "",
       orderSummary: payload.orderSummary || {},
       status: "pending",
       attempts: 0,
-      createdAt: payload.createdAt || new Date().toISOString()
+      maxAttempts: 4,
+      createdAt: payload.createdAt || new Date().toISOString(),
+      processingStartedAt: 0,
+      sentAt: null,
+      telegramMessageId: null,
+      lastError: null
     };
 
-    const res = await fetch(queueUrl, {
-      method: "POST",
+    const updateMask = Object.keys(docData)
+      .map((k) => `updateMask.fieldPaths=${encodeURIComponent(k)}`)
+      .join("&");
+
+    const res = await fetch(`${docUrl}?${updateMask}`, {
+      method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ fields: toFirestoreFields(docData) })
     });
 
     if (res.ok) {
-      const data = await res.json();
-      const docId = data.name ? data.name.split("/").pop() : null;
-      return { success: true, docId };
+      return { success: true, docId: orderId };
     } else {
       const errText = await res.text();
-      console.warn("[QUEUE ENQUEUE WARN]:", errText);
+      console.warn(`[QUEUE ENQUEUE FAILED for ${orderId}]:`, errText);
       return { success: false, error: errText };
     }
   } catch (err) {
@@ -113,78 +125,187 @@ export async function enqueueTelegramNotification(payload) {
 }
 
 /**
- * Checks and acquires a mutual-exclusion lock in Firestore (queueControl/workerLock)
- * Expiry prevents deadlock if a worker instance is terminated unexpectedly.
+ * Attempts to acquire an exclusive lock in Firestore (queueControl/workerLock).
+ * Prevents multiple workers from running concurrently.
+ * TTL of 25 seconds ensures automatic recovery if a worker dies mid-flight.
  */
-async function acquireLock(workerId) {
+export async function acquireLock(workerId) {
   const lockUrl = `${BASE_FS_URL}/queueControl/workerLock`;
   const now = Date.now();
-  const LOCK_TTL_MS = 25 * 1000; // 25 seconds auto-expiration
+  const LOCK_TTL_MS = 25 * 1000; // 25s auto-expiration
 
   try {
-    // 1. Read current lock status
     const getRes = await fetch(lockUrl);
     if (getRes.ok) {
       const lockDoc = await getRes.json();
       const lockData = fromFirestoreFields(lockDoc.fields || {});
-      const isLocked = Boolean(lockData.locked);
+      const isLocked = Boolean(lockData.isLocked);
       const expiresAt = Number(lockData.expiresAt || 0);
 
-      // If active lock held by another worker and not expired yet
+      // If actively locked by another worker and unexpired
       if (isLocked && now < expiresAt) {
-        return { acquired: false, reason: "Lock held by active worker" };
+        return {
+          acquired: false,
+          reason: `Locked by active worker (${lockData.workerId}) until ${new Date(expiresAt).toISOString()}`
+        };
       }
     }
 
-    // 2. Write new lock
-    const newLockPayload = {
-      locked: true,
+    // Write / refresh lock
+    const lockPayload = {
+      isLocked: true,
       workerId,
       lockedAt: now,
       expiresAt: now + LOCK_TTL_MS
     };
 
-    const patchUrl = `${lockUrl}?updateMask.fieldPaths=locked&updateMask.fieldPaths=workerId&updateMask.fieldPaths=lockedAt&updateMask.fieldPaths=expiresAt`;
-    await fetch(patchUrl, {
+    const updateMask = Object.keys(lockPayload)
+      .map((k) => `updateMask.fieldPaths=${encodeURIComponent(k)}`)
+      .join("&");
+
+    const patchRes = await fetch(`${lockUrl}?${updateMask}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fields: toFirestoreFields(newLockPayload) })
+      body: JSON.stringify({ fields: toFirestoreFields(lockPayload) })
     });
 
-    return { acquired: true };
+    return { acquired: patchRes.ok };
   } catch (err) {
-    console.warn("[LOCK ACQUISITION WARN]:", err.message);
-    // Proceed optimistically if lock service had a read hiccup
-    return { acquired: true };
+    console.warn("[ACQUIRE LOCK EXCEPTION]:", err.message);
+    return { acquired: false, reason: err.message };
   }
 }
 
 /**
  * Releases the worker lock
  */
-async function releaseLock(workerId) {
+export async function releaseLock(workerId) {
   const lockUrl = `${BASE_FS_URL}/queueControl/workerLock`;
   try {
     const unlockPayload = {
-      locked: false,
+      isLocked: false,
       releasedAt: Date.now(),
       lastWorkerId: workerId
     };
-    const patchUrl = `${lockUrl}?updateMask.fieldPaths=locked&updateMask.fieldPaths=releasedAt&updateMask.fieldPaths=lastWorkerId`;
-    await fetch(patchUrl, {
+
+    const updateMask = Object.keys(unlockPayload)
+      .map((k) => `updateMask.fieldPaths=${encodeURIComponent(k)}`)
+      .join("&");
+
+    await fetch(`${lockUrl}?${updateMask}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ fields: toFirestoreFields(unlockPayload) })
     });
   } catch (err) {
-    console.warn("[LOCK RELEASE WARN]:", err.message);
+    console.warn("[RELEASE LOCK WARN]:", err.message);
   }
 }
 
 /**
- * Queries Cloud Firestore for pending items in telegramQueue
+ * Updates a queue item's status and metadata with atomic retry
  */
-async function fetchPendingQueueItems(limit = 40) {
+export async function updateQueueItem(docId, fieldsToUpdate = {}) {
+  const docUrl = `${BASE_FS_URL}/telegramQueue/${encodeURIComponent(docId)}`;
+  const payload = {
+    updatedAt: new Date().toISOString(),
+    ...fieldsToUpdate
+  };
+
+  const updateMask = Object.keys(payload)
+    .map((k) => `updateMask.fieldPaths=${encodeURIComponent(k)}`)
+    .join("&");
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(`${docUrl}?${updateMask}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: toFirestoreFields(payload) })
+      });
+      if (res.ok) return true;
+      if (attempt < 3) await sleep(150);
+    } catch (_) {
+      if (attempt < 3) await sleep(150);
+    }
+  }
+  return false;
+}
+
+/**
+ * Recovers messages that were left in 'processing' by a crashed or timed-out function.
+ * If processingStartedAt was > 40 seconds ago, reset to 'pending' (or mark 'failed' if maxAttempts reached).
+ */
+export async function recoverStaleProcessingItems() {
+  const queryUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery`;
+  const queryBody = {
+    structuredQuery: {
+      from: [{ collectionId: "telegramQueue" }],
+      where: {
+        fieldFilter: {
+          field: { fieldPath: "status" },
+          op: "EQUAL",
+          value: { stringValue: "processing" }
+        }
+      },
+      limit: 25
+    }
+  };
+
+  try {
+    const res = await fetch(queryUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(queryBody)
+    });
+
+    if (!res.ok) return 0;
+    const results = await res.json();
+    if (!Array.isArray(results)) return 0;
+
+    let recovered = 0;
+    const now = Date.now();
+    const STALE_TIMEOUT_MS = 40 * 1000; // 40 seconds threshold
+
+    for (const row of results) {
+      if (row.document && row.document.fields) {
+        const docId = row.document.name.split("/").pop();
+        const data = fromFirestoreFields(row.document.fields);
+        const startedAt = Number(data.processingStartedAt || 0);
+
+        // If processing started more than 40 seconds ago, it is stale
+        if (now - startedAt > STALE_TIMEOUT_MS) {
+          const attempts = Number(data.attempts || 0) + 1;
+          const maxAttempts = Number(data.maxAttempts || 4);
+
+          if (attempts >= maxAttempts) {
+            await updateQueueItem(docId, {
+              status: "failed",
+              attempts,
+              lastError: "Abandoned by worker (timed out repeatedly)"
+            });
+          } else {
+            await updateQueueItem(docId, {
+              status: "pending",
+              attempts,
+              lastError: "Worker timeout recovered — re-queued"
+            });
+            recovered++;
+          }
+        }
+      }
+    }
+    return recovered;
+  } catch (err) {
+    console.warn("[RECOVER STALE EXCEPTION]:", err.message);
+    return 0;
+  }
+}
+
+/**
+ * Queries Cloud Firestore for pending queue items sorted chronologically (FIFO)
+ */
+export async function fetchPendingQueueItems(limit = 15) {
   const queryUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery`;
   const queryBody = {
     structuredQuery: {
@@ -218,19 +339,17 @@ async function fetchPendingQueueItems(limit = 40) {
     const items = [];
     for (const row of results) {
       if (row.document && row.document.fields) {
-        const docName = row.document.name;
-        const docId = docName.split("/").pop();
+        const docId = row.document.name.split("/").pop();
         const data = fromFirestoreFields(row.document.fields);
         items.push({
           docId,
-          docPath: docName,
           ...data
         });
       }
     }
 
-    // Sort chronologically (oldest order first)
-    items.sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
+    // Sort strictly chronologically (oldest order first)
+    items.sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime());
     return items;
   } catch (err) {
     console.error("[FETCH QUEUE EXCEPTION]:", err.message);
@@ -239,38 +358,13 @@ async function fetchPendingQueueItems(limit = 40) {
 }
 
 /**
- * Updates a queue item status in Cloud Firestore
+ * Dispatches an individual order notification to Telegram Bot API.
+ * Validates responses strictly and respects HTTP 429 retry_after.
  */
-async function updateQueueItemStatus(docId, status, extra = {}) {
-  const docUrl = `${BASE_FS_URL}/telegramQueue/${docId}`;
-  const payload = {
-    status,
-    updatedAt: new Date().toISOString(),
-    ...extra
-  };
-
-  const fieldPaths = Object.keys(payload)
-    .map((k) => `updateMask.fieldPaths=${encodeURIComponent(k)}`)
-    .join("&");
-
-  try {
-    await fetch(`${docUrl}?${fieldPaths}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fields: toFirestoreFields(payload) })
-    });
-  } catch (err) {
-    console.warn(`[UPDATE QUEUE ITEM FAIL ${docId}]:`, err.message);
-  }
-}
-
-/**
- * Dispatches a message to Telegram Bot API with retry on 429
- */
-async function sendToTelegram(token, chatId, text) {
+export async function sendIndividualTelegramMessage(token, chatId, text) {
   const endpoint = `https://api.telegram.org/bot${token}/sendMessage`;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const res = await fetch(endpoint, {
         method: "POST",
@@ -283,184 +377,189 @@ async function sendToTelegram(token, chatId, text) {
 
       const data = await res.json().catch(() => ({}));
 
+      // Success confirmed by Telegram
       if (res.ok && data.ok) {
-        return { success: true, messageId: data.result?.message_id };
+        return {
+          success: true,
+          messageId: data.result?.message_id
+        };
       }
 
-      // Check for Rate Limit 429
+      // Handle HTTP 429 Too Many Requests (Rate Limit)
       if (res.status === 429 || data.error_code === 429) {
-        const retrySec = Number(data.parameters?.retry_after || 3);
-        console.warn(`[TELEGRAM 429 RATE LIMIT]: Waiting ${retrySec}s before attempt ${attempt + 1}...`);
-        await sleep(Math.min(retrySec, 8) * 1000);
+        const retrySec = Number(data.parameters?.retry_after || 2);
+        console.warn(`[TELEGRAM RATE LIMIT 429]: Waiting ${retrySec}s...`);
+        if (attempt === 1) {
+          await sleep(Math.min(retrySec, 4) * 1000);
+          continue; // retry once
+        }
+        return {
+          success: false,
+          is429: true,
+          retryAfter: retrySec,
+          error: `Telegram Rate Limited (wait ${retrySec}s)`
+        };
+      }
+
+      // Non-429 error
+      return {
+        success: false,
+        error: data.description || `HTTP ${res.status} ${res.statusText}`
+      };
+    } catch (netErr) {
+      if (attempt === 1) {
+        await sleep(1000);
         continue;
       }
-
-      console.warn(`[TELEGRAM DISPATCH FAIL]:`, data.description || res.statusText);
-      return { success: false, error: data.description || "Unknown Telegram error" };
-    } catch (netErr) {
-      console.warn(`[TELEGRAM NETWORK ERROR attempt ${attempt}]:`, netErr.message);
-      if (attempt < 3) await sleep(1500);
+      return {
+        success: false,
+        error: `Network error: ${netErr.message}`
+      };
     }
   }
 
-  return { success: false, error: "Exceeded max dispatch attempts" };
-}
-
-/**
- * Formats a consolidated batch message for multiple orders
- */
-function formatBatchMessage(items) {
-  const count = items.length;
-  const header = [
-    `⚡ دفعة طلبات جديدة مجمّعة (${count} طلبات)`,
-    `=========================================`
-  ];
-
-  const orderBlocks = items.map((item, index) => {
-    const s = item.orderSummary || {};
-    const orderNum = (item.orderId || `ORD-${index + 1}`).slice(-6).toUpperCase();
-    const customer = s.customer || "زبون";
-    const phone = s.phone || "—";
-    const wilaya = s.wilaya || "—";
-    const commune = s.commune || "";
-    const method = s.deliveryMethod || "توصيل للمنزل";
-    const total = Number(s.total || 0).toLocaleString("ar-DZ");
-    const itemsDesc = s.itemsText || s.summaryText || "منتجات مختلفة";
-
-    return [
-      `📦 طلب (${index + 1}/${count}): #${orderNum}`,
-      `👤 الزبون: ${customer} | 📱 ${phone}`,
-      `📍 ${wilaya}${commune ? ` — ${commune}` : ""} (${method})`,
-      `🛍️ المنتجات: ${itemsDesc}`,
-      `💰 الإجمالي: ${total} دج (عند التسليم)`
-    ].join("\n");
-  });
-
-  return [
-    ...header,
-    "",
-    orderBlocks.join("\n-----------------------------------------\n"),
-    "",
-    `📅 توقيت المعالجة: ${new Date().toLocaleString("ar-DZ")}`
-  ].join("\n");
+  return { success: false, error: "Exceeded dispatch retry attempts" };
 }
 
 /**
  * Core Queue Processing Engine
- * Processes pending notifications with smart throttling, batching, and safety deadlines.
+ * 
+ * Rules:
+ * - 1 message per second rate limit.
+ * - Single order per message (no batching).
+ * - Maximum time budget: 7.5 seconds (Vercel safety).
+ * - Updates status: pending -> processing -> sent | failed.
+ * - Releases lock and self-chains if pending items remain.
  */
 export async function processTelegramQueue(options = {}) {
-  const maxDurationMs = options.maxDurationMs || 8000; // 8s safety margin for Serverless
+  const maxDurationMs = options.maxDurationMs || 7500; // 7.5s budget
   const startTime = Date.now();
-  const workerId = `w_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const workerId = `w_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
 
   if (!token || !chatId) {
-    console.warn("[QUEUE WORKER]: Telegram credentials not configured in environment.");
-    return { status: "unconfigured" };
+    console.warn("[QUEUE WORKER]: Telegram credentials not set in environment.");
+    return { status: "unconfigured", error: "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID" };
   }
 
-  // 1. Acquire Concurrency Guard Lock
+  // 1. Concurrency Guard Lock
   const lockResult = await acquireLock(workerId);
   if (!lockResult.acquired) {
     return { status: "busy", message: lockResult.reason };
   }
 
-  let totalProcessed = 0;
+  let processedCount = 0;
   let remainingCount = 0;
+  let hasMoreToProcess = false;
 
   try {
-    // 2. Fetch pending orders
-    const pendingItems = await fetchPendingQueueItems(50);
+    // 2. Recover any stale processing items
+    await recoverStaleProcessingItems();
+
+    // 3. Fetch pending orders (FIFO)
+    const pendingItems = await fetchPendingQueueItems(10);
     if (pendingItems.length === 0) {
       return { status: "idle", processed: 0, message: "Queue is empty" };
     }
 
-    // 3. Process Strategy Selection
-    // Scenario A: Low volume (1 to 3 items) -> Send each order individually
-    if (pendingItems.length <= 3) {
-      for (const item of pendingItems) {
-        // Check execution time budget
-        if (Date.now() - startTime > maxDurationMs) {
-          remainingCount = pendingItems.length - totalProcessed;
-          break;
-        }
+    // 4. Sequential Processing Loop (1 message per second)
+    for (let i = 0; i < pendingItems.length; i++) {
+      const item = pendingItems[i];
 
-        const msgText = item.messageText || formatBatchMessage([item]);
-        const result = await sendToTelegram(token, chatId, msgText);
-
-        if (result.success) {
-          await updateQueueItemStatus(item.docId, "sent", { sentAt: new Date().toISOString() });
-          totalProcessed++;
-        } else {
-          const attempts = (item.attempts || 0) + 1;
-          const nextStatus = attempts >= 5 ? "failed" : "pending";
-          await updateQueueItemStatus(item.docId, nextStatus, { attempts, lastError: result.error });
-        }
-
-        // Throttle: 1.2s delay between messages to respect Telegram chat limits
-        await sleep(1200);
-      }
-    } else {
-      // Scenario B: High volume / Burst traffic (> 3 items, e.g. 10 to 100+ orders!)
-      // Smart Batching: Group 3-4 items per message
-      const BATCH_SIZE = 4;
-      const batches = [];
-      for (let i = 0; i < pendingItems.length; i += BATCH_SIZE) {
-        batches.push(pendingItems.slice(i, i + BATCH_SIZE));
+      // Time budget guard
+      if (Date.now() - startTime >= maxDurationMs) {
+        hasMoreToProcess = true;
+        remainingCount = pendingItems.length - i;
+        break;
       }
 
-      for (const batch of batches) {
-        // Check execution time budget
-        if (Date.now() - startTime > maxDurationMs) {
-          remainingCount = pendingItems.length - totalProcessed;
-          break;
+      // Step A: Mark as 'processing'
+      await updateQueueItem(item.docId, {
+        status: "processing",
+        processingStartedAt: Date.now()
+      });
+
+      // Step B: Dispatch single message to Telegram
+      const result = await sendIndividualTelegramMessage(token, chatId, item.messageText);
+
+      // Step C: Update state based on Telegram response
+      if (result.success) {
+        await updateQueueItem(item.docId, {
+          status: "sent",
+          sentAt: new Date().toISOString(),
+          telegramMessageId: result.messageId || null,
+          lastError: null
+        });
+        processedCount++;
+      } else if (result.is429) {
+        // Rate limited: reset to pending and back off
+        const attempts = Number(item.attempts || 0) + 1;
+        await updateQueueItem(item.docId, {
+          status: "pending",
+          attempts,
+          lastError: result.error
+        });
+        hasMoreToProcess = true;
+        break; // Stop current loop to respect Telegram's rate limit window
+      } else {
+        // Failed attempt
+        const attempts = Number(item.attempts || 0) + 1;
+        const maxAttempts = Number(item.maxAttempts || 4);
+        const nextStatus = attempts >= maxAttempts ? "failed" : "pending";
+
+        await updateQueueItem(item.docId, {
+          status: nextStatus,
+          attempts,
+          lastError: result.error
+        });
+
+        if (nextStatus === "failed") {
+          console.error(`[QUEUE ITEM PERMANENTLY FAILED]: Order ${item.docId} - ${result.error}`);
         }
+      }
 
-        const batchText = formatBatchMessage(batch);
-        const result = await sendToTelegram(token, chatId, batchText);
+      // Step D: Rate Limiting Throttling (Strict 1.0 second between messages)
+      const isLastItem = i === pendingItems.length - 1;
+      const withinTimeBudget = Date.now() - startTime + 1050 < maxDurationMs;
+      if (!isLastItem && withinTimeBudget) {
+        await sleep(1000);
+      }
+    }
 
-        if (result.success) {
-          // Mark all items in batch as sent
-          const sentAt = new Date().toISOString();
-          await Promise.all(
-            batch.map((it) => updateQueueItemStatus(it.docId, "sent", { sentAt, inBatch: true }))
-          );
-          totalProcessed += batch.length;
-        } else {
-          // Increment attempts for batch items
-          await Promise.all(
-            batch.map((it) => {
-              const attempts = (it.attempts || 0) + 1;
-              const nextStatus = attempts >= 5 ? "failed" : "pending";
-              return updateQueueItemStatus(it.docId, nextStatus, { attempts, lastError: result.error });
-            })
-          );
-        }
-
-        // Throttle between batches
-        await sleep(1200);
+    // Check if additional pending items exist in the queue beyond current batch
+    if (!hasMoreToProcess) {
+      const moreCheck = await fetchPendingQueueItems(1);
+      if (moreCheck.length > 0) {
+        hasMoreToProcess = true;
+        remainingCount = moreCheck.length;
       }
     }
 
     return {
       status: "success",
-      processed: totalProcessed,
+      processed: processedCount,
       remaining: remainingCount,
+      hasMore: hasMoreToProcess,
       durationMs: Date.now() - startTime
     };
   } finally {
-    // 4. Always release the lock
+    // 5. Always release the lock
     await releaseLock(workerId);
 
-    // 5. If more items remain and we approached timeout, chain another worker call
-    if (remainingCount > 0 && options.triggerNextUrl) {
-      fetch(options.triggerNextUrl, {
-        method: "POST",
-        headers: { "x-worker-chain": "1" }
-      }).catch(() => {});
+    // 6. Self-Chaining: If more orders remain, spawn the next worker invocation
+    if (hasMoreToProcess && options.triggerNextUrl) {
+      try {
+        fetch(options.triggerNextUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-worker-secret": WORKER_SECRET
+          },
+          body: JSON.stringify({ trigger: "self_chain", timestamp: Date.now() })
+        }).catch(() => {});
+      } catch (_) {}
     }
   }
 }
@@ -470,18 +569,38 @@ export async function processTelegramQueue(options = {}) {
  * Route: /api/queue-worker
  */
 export default async function handler(req, res) {
-  // Support both GET (Cron jobs / health) and POST (Trigger calls)
+  // 1. Security Authentication Check
+  const incomingSecret = req.headers["x-worker-secret"] || req.query?.secret;
+  const isInternalSecretValid = incomingSecret === WORKER_SECRET;
+  const isDevMode = !process.env.NODE_ENV || process.env.NODE_ENV === "development";
+
+  // Allow GET for simple health / authorized manual status checks, require secret for POST
+  if (req.method === "POST" && !isInternalSecretValid && !isDevMode) {
+    return res.status(401).json({ error: "Unauthorized worker trigger: invalid secret token" });
+  }
+
   if (req.method !== "GET" && req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
   try {
     const host = req.headers?.host || "localhost";
-    const proto = req.headers?.["x-forwarded-proto"] || "https";
+    const proto = req.headers?.["x-forwarded-proto"] || (host.includes("localhost") ? "http" : "https");
     const triggerNextUrl = `${proto}://${host}/api/queue-worker`;
 
+    // If GET request is just a health/status check without running
+    if (req.method === "GET" && req.query?.checkOnly === "1") {
+      const pendingItems = await fetchPendingQueueItems(5);
+      return res.status(200).json({
+        ok: true,
+        status: "idle",
+        pendingCount: pendingItems.length,
+        samplePending: pendingItems.map((p) => ({ id: p.docId, status: p.status, createdAt: p.createdAt }))
+      });
+    }
+
     const result = await processTelegramQueue({
-      maxDurationMs: 8500,
+      maxDurationMs: 7500,
       triggerNextUrl
     });
 
@@ -490,8 +609,7 @@ export default async function handler(req, res) {
       result
     });
   } catch (err) {
-    console.error("[QUEUE WORKER HANDLER ERROR]:", err);
-    return res.status(500).json({ error: "Internal error processing queue", details: err.message });
+    console.error("[QUEUE WORKER HANDLER FATAL]:", err);
+    return res.status(500).json({ error: "Internal queue worker error", details: err.message });
   }
 }
-

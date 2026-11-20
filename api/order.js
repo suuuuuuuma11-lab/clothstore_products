@@ -13,7 +13,7 @@
 
 import { DEFAULT_SHIPPING_RATES } from "../frontend/data/default-shipping-rates.js";
 import { ALGERIA_LOCATIONS } from "../frontend/data/algeria-locations.js";
-import { enqueueTelegramNotification, processTelegramQueue } from "./queue-worker.js";
+import { enqueueTelegramNotification, WORKER_SECRET } from "./queue-worker.js";
 
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "clothstore-a9b2c";
 
@@ -226,8 +226,8 @@ export default async function handler(req, res) {
       createdAt: new Date().toISOString()
     };
 
-    // 6. Write Order to Cloud Firestore via REST API
-    let createdOrderId = `ord-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    // 6. Write Order to Cloud Firestore (Authoritative Source of Truth)
+    let createdOrderId = null;
     try {
       const fsUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/orders`;
       const fsRes = await fetch(fsUrl, {
@@ -236,21 +236,30 @@ export default async function handler(req, res) {
         body: JSON.stringify({ fields: toFirestoreFields(orderPayload) })
       });
 
-      if (fsRes.ok) {
-        const docResult = await fsRes.json();
-        if (docResult.name) {
-          createdOrderId = docResult.name.split("/").pop();
-        }
-      } else {
+      if (!fsRes.ok) {
         const errBody = await fsRes.text();
-        console.warn("[BACKEND ORDER WRITE FALLBACK] Firestore REST response:", errBody);
+        console.error("[BACKEND ORDER WRITE ERROR]:", errBody);
+        return res.status(500).json({
+          success: false,
+          error: "تعذر تسجيل الطلب في قاعدة البيانات. يرجى المحاولة مرة أخرى."
+        });
+      }
+
+      const docResult = await fsRes.json();
+      if (docResult && docResult.name) {
+        createdOrderId = docResult.name.split("/").pop();
+      } else {
+        throw new Error("لم يتم استلام معرف الطلب من Firestore");
       }
     } catch (fsErr) {
-      console.warn("[BACKEND ORDER WRITE ERROR]:", fsErr.message);
+      console.error("[BACKEND ORDER WRITE EXCEPTION]:", fsErr.message);
+      return res.status(500).json({
+        success: false,
+        error: "حدث خطأ أثناء حفظ الطلب في قاعدة البيانات. يرجى المحاولة مرة أخرى."
+      });
     }
 
-    // 7. Enqueue Telegram Notification & Trigger Safe Queue Worker
-    let telegramQueued = false;
+    // 7. Enqueue Telegram Notification Reliably & Trigger Asynchronous Worker
     try {
       const methodDesc = method === "home" ? "توصيل للمنزل" : "استلام من المكتب";
       const itemsText = sanitizedItems.map(it => {
@@ -299,35 +308,39 @@ export default async function handler(req, res) {
           total: verifiedTotal
         },
         status: "pending",
-        attempts: 0,
         createdAt: new Date().toISOString()
       };
 
-      const qRes = await enqueueTelegramNotification(queuePayload);
-      telegramQueued = Boolean(qRes && qRes.success);
+      await enqueueTelegramNotification(queuePayload);
 
-      // Trigger the queue processor inline so messages are dispatched before Lambda response
+      // Trigger queue worker asynchronously without delaying customer confirmation
       const host = req.headers?.host || "localhost";
-      const proto = req.headers?.["x-forwarded-proto"] || "https";
+      const proto = req.headers?.["x-forwarded-proto"] || (host.includes("localhost") ? "http" : "https");
       const triggerNextUrl = `${proto}://${host}/api/queue-worker`;
 
-      await processTelegramQueue({
-        maxDurationMs: 3500,
-        triggerNextUrl
-      }).catch(workerErr => {
-        console.warn("[QUEUE WORKER INLINE WARNING]:", workerErr.message);
-      });
+      const abortCtrl = new AbortController();
+      const abortTimer = setTimeout(() => abortCtrl.abort(), 250); // 250ms connection handshake window
+
+      fetch(triggerNextUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-worker-secret": WORKER_SECRET
+        },
+        body: JSON.stringify({ trigger: "new_order", orderId: createdOrderId, timestamp: Date.now() }),
+        signal: abortCtrl.signal
+      }).catch(() => {}).finally(() => clearTimeout(abortTimer));
 
     } catch (tgErr) {
       console.warn("[TELEGRAM ENQUEUE WARNING]:", tgErr.message);
     }
 
+    // Customer receives confirmed response immediately after Firestore save succeeds
     return res.status(200).json({
       success: true,
       orderId: createdOrderId,
       order: orderPayload,
-      telegramSent: telegramQueued,
-      queued: telegramQueued
+      status: "confirmed"
     });
 
   } catch (err) {

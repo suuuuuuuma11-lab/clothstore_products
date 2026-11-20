@@ -9,7 +9,7 @@
  * 4. Compatible with Vercel Serverless Functions and Node.js HTTP servers.
  */
 
-import { enqueueTelegramNotification, processTelegramQueue } from "./queue-worker.js";
+import { enqueueTelegramNotification, WORKER_SECRET } from "./queue-worker.js";
 
 // Simple in-memory rate limiter per IP
 const rateLimitMap = new Map();
@@ -157,15 +157,23 @@ export default async function handler(req, res) {
 
     const queueRes = await enqueueTelegramNotification(queuePayload);
 
-    // Trigger queue processor inline with short budget (3.5s)
+    // Trigger queue processor asynchronously
     const host = req.headers?.host || 'localhost';
-    const proto = req.headers?.['x-forwarded-proto'] || 'https';
+    const proto = req.headers?.['x-forwarded-proto'] || (host.includes('localhost') ? 'http' : 'https');
     const triggerNextUrl = `${proto}://${host}/api/queue-worker`;
 
-    await processTelegramQueue({
-      maxDurationMs: 3500,
-      triggerNextUrl
-    }).catch(err => console.warn('[TELEGRAM QUEUE TRIGGER WARN]:', err.message));
+    const abortCtrl = new AbortController();
+    const abortTimer = setTimeout(() => abortCtrl.abort(), 250);
+
+    fetch(triggerNextUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-worker-secret': WORKER_SECRET
+      },
+      body: JSON.stringify({ trigger: 'telegram_fallback', orderId: safeOrderId, timestamp: Date.now() }),
+      signal: abortCtrl.signal
+    }).catch(() => {}).finally(() => clearTimeout(abortTimer));
 
     return res.status(200).json({
       success: true,
